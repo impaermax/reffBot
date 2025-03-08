@@ -1,5 +1,11 @@
 import sqlite3
 from telebot import TeleBot, types
+import csv
+import os
+from io import StringIO
+from datetime import datetime, date
+import threading
+import time
 
 # --- Настройки бота ---
 API_TOKEN = '7827212867:AAFal1er6Z_voA_HgLA-pz1bM_yhl2jAGQI'
@@ -8,50 +14,51 @@ bot = TeleBot(API_TOKEN)
 print("START===")
 
 # --- Подключение к базе данных ---
-conn = sqlite3.connect('referrals.db', check_same_thread=False)
+DB_FILE = 'referrals.db'
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
 
 # --- Инициализация базы данных ---
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    balance REAL DEFAULT 0,
-    hold_balance REAL DEFAULT 0,
-    referrer_id INTEGER,
-    referrals_count INTEGER DEFAULT 0
-)
-''')
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS channels (
-    channel_id INTEGER PRIMARY KEY,
-    channel_name TEXT
-)
-''')
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS stats (
-    date TEXT PRIMARY KEY,
-    new_users INTEGER DEFAULT 0,
-    top_users TEXT
-)
-''')
-conn.commit()
+def init_db():
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        balance REAL DEFAULT 0,
+        hold_balance REAL DEFAULT 0,
+        referrer_id INTEGER,
+        referrals_count INTEGER DEFAULT 0
+    )
+    ''')
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS channels (
+        channel_id INTEGER PRIMARY KEY,
+        channel_name TEXT
+    )
+    ''')
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS stats (
+        date TEXT PRIMARY KEY,
+        new_users INTEGER DEFAULT 0,
+        top_users TEXT
+    )
+    ''')
+    conn.commit()
+
+# Вызываем инициализацию при старте
+init_db()
 
 # --- Проверка подписки ---
 def check_subscription(user_id):
     cursor.execute("SELECT channel_id, channel_name FROM channels")
     channels = cursor.fetchall()
     if not channels:
-        return True  # Если нет добавленных каналов, пропускаем проверку
+        return True
     
-    # Создаем инлайн-клавиатуру с кнопками подписки
     markup = types.InlineKeyboardMarkup(row_width=1)
-    buttons = []
-    for channel in channels:
-        buttons.append(types.InlineKeyboardButton(text=f"Подписаться на @{channel[1]}", url=f"https://t.me/{channel[1]}"))
+    buttons = [types.InlineKeyboardButton(text=f"Подписаться на @{channel[1]}", url=f"https://t.me/{channel[1]}") for channel in channels]
     buttons.append(types.InlineKeyboardButton(text="Проверить подписку", callback_data="check_subs"))
     markup.add(*buttons)
     
-    # Проверяем подписку пользователя
     for channel in channels:
         try:
             member = bot.get_chat_member(channel[0], user_id)
@@ -63,13 +70,12 @@ def check_subscription(user_id):
             return False
     return True
 
-# Обработка кнопки "Проверить подписку"
 @bot.callback_query_handler(func=lambda call: call.data == "check_subs")
 def check_subs_callback(call):
     user_id = call.from_user.id
-    if check_subscription(user_id):  # Повторная проверка подписки
+    if check_subscription(user_id):
         bot.send_message(user_id, "✅ Вы успешно подписались на все каналы! Теперь вы можете использовать бота.")
-        start_command(call.message)  # Запускаем команду /start
+        start_command(call.message)
     else:
         bot.answer_callback_query(call.id, "❌ Вы не подписаны на все каналы. Пожалуйста, проверьте подписку.", show_alert=True)
 
@@ -77,7 +83,7 @@ def check_subs_callback(call):
 @bot.message_handler(commands=['start'])
 def start_command(message):
     if not check_subscription(message.from_user.id):
-        return  # Если пользователь не прошел проверку подписки, ничего больше не делаем
+        return
     
     user_id = message.from_user.id
     referrer_id = None
@@ -97,6 +103,12 @@ def start_command(message):
         cursor.execute("INSERT INTO users (user_id, referrer_id) VALUES (?, ?)", (user_id, referrer_id))
         conn.commit()
         
+        # Обновляем статистику новых пользователей
+        today = date.today().isoformat()
+        cursor.execute("INSERT OR IGNORE INTO stats (date, new_users) VALUES (?, 0)", (today,))
+        cursor.execute("UPDATE stats SET new_users = new_users + 1 WHERE date = ?", (today,))
+        conn.commit()
+        
         if referrer_id:
             cursor.execute("SELECT * FROM users WHERE user_id = ?", (referrer_id,))
             referrer = cursor.fetchone()
@@ -113,8 +125,6 @@ def start_command(message):
     
     referral_link = f"https://t.me/{bot.get_me().username}?start={user_id}"
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    
-    # Изменяем порядок кнопок
     markup.add("⭐ Заработать звезды", "💸 Вывод")
     markup.add("📊 Статистика", "🏆 Топ", "ℹ️ Помощь")
     
@@ -159,13 +169,9 @@ def check_and_unlock(referrer_id):
     if grand_referrer and grand_referrer[0]:
         check_and_unlock(grand_referrer[0])
 
-# --- Остальной код остается без изменений ---
-
 @bot.message_handler(func=lambda message: message.text == "⭐ Заработать звезды")
 def show_balance_with_referral(message):
     user_id = message.from_user.id
-    
-    # Получаем данные пользователя
     cursor.execute("SELECT balance, hold_balance FROM users WHERE user_id = ?", (user_id,))
     user = cursor.fetchone()
     if not user:
@@ -174,8 +180,6 @@ def show_balance_with_referral(message):
     
     balance, hold_balance = user
     referral_link = f"https://t.me/{bot.get_me().username}?start={user_id}"
-    
-    # Формируем текст сообщения
     text = (
         "👤 Реферальная программа\n"
         "➖➖➖➖➖➖➖➖➖➖\n"
@@ -186,15 +190,12 @@ def show_balance_with_referral(message):
         "➖➖➖➖➖➖➖➖➖➖"
     )
     
-    # Отправляем фото с текстом
     try:
         with open('photo.jpg', 'rb') as photo_file:
             bot.send_photo(user_id, photo_file, caption=text)
     except FileNotFoundError:
         bot.send_message(user_id, "❌ Файл photo.jpg не найден. Пожалуйста, убедитесь, что файл существует.")
-        bot.send_message(user_id, text)  # Если фото отсутствует, отправляем только текст
-
-# --- Остальной код остается без изменений ---
+        bot.send_message(user_id, text)
 
 @bot.message_handler(func=lambda message: message.text == "ℹ️ Помощь")
 def help_command(message):
@@ -248,7 +249,6 @@ def leaderboard_command(message):
 @bot.message_handler(func=lambda message: message.text == "💸 Вывод")
 def withdraw_request(message):
     user_id = message.from_user.id
-    
     cursor.execute("""
         SELECT balance, 
                (SELECT COUNT(*) FROM users WHERE referrer_id = ?) AS total_referrals,
@@ -272,14 +272,12 @@ def withdraw_request(message):
 def process_withdraw_request(message):
     username = message.text
     user_id = message.from_user.id
-    
     cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
     balance = cursor.fetchone()[0]
     
     bot.send_message(YOUR_ADMIN_ID, f"-New Withdraw Request-\n"
                                     f"User: @{username} ({user_id})\n"
                                     f"Balance: {balance:.1f} stars")
-    
     bot.send_message(user_id, f"📝 Ваша заявка на вывод отправлена администраторам.\n"
                               f"Баланс: {balance:.1f} звезд\n"
                               f"Свяжитесь с администратором для подтверждения: @GromovALX")
@@ -295,7 +293,8 @@ def admin_panel(message):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add("👥 Статистика пользователей", "📝 Рассылка")
     markup.add("⚙️ Управление каналами")
-    markup.add("🏠 Главное меню")  # Добавляем кнопку главного меню
+    markup.add("📥 Выгрузить базу данных")
+    markup.add("🏠 Главное меню")
     
     bot.send_message(user_id, "👨‍💻 Админ-панель:", reply_markup=markup)
 
@@ -303,7 +302,6 @@ def admin_panel(message):
 def users_stats(message):
     cursor.execute("SELECT COUNT(*) FROM users")
     total_users = cursor.fetchone()[0]
-    
     cursor.execute("SELECT COUNT(*) FROM users WHERE referrals_count > 0")
     active_users = cursor.fetchone()[0]
     
@@ -332,7 +330,6 @@ def process_mailing(message):
     
     cursor.execute("SELECT user_id FROM users")
     users = cursor.fetchall()
-    
     success_count = 0
     for user in users:
         try:
@@ -360,16 +357,13 @@ def add_channel(message):
 
 def process_add_channel(message):
     channel_link = message.text.strip()
-    
     if not channel_link.startswith('@') and not channel_link.startswith('https://t.me/'):
         bot.send_message(message.chat.id, "❌ Некорректный формат ссылки. Используйте @channel_username или https://t.me/channel_username.")
         return
     
     channel_name = channel_link.replace('https://t.me/', '').replace('@', '').strip()
-    
     try:
         chat = bot.get_chat(f"@{channel_name}")
-        
         member = bot.get_chat_member(chat.id, bot.get_me().id)
         if member.status != 'administrator':
             bot.send_message(message.chat.id, f"❌ Бот не является администратором канала {chat.title}.")
@@ -420,7 +414,79 @@ def list_channels(message):
 
 @bot.message_handler(func=lambda message: message.text == "🏠 Главное меню" and message.from_user.id == YOUR_ADMIN_ID)
 def back_to_main_menu(message):
-    admin_panel(message)  # Возвращаемся к главному меню админ-панели
+    admin_panel(message)
 
+@bot.message_handler(func=lambda message: message.text == "📥 Выгрузить базу данных" and message.from_user.id == YOUR_ADMIN_ID)
+def export_database(message):
+    export_users_db(message.chat.id)
+
+# --- Ежедневная выгрузка и статистика ---
+def export_users_db(chat_id):
+    try:
+        cursor.execute("""
+            SELECT user_id, balance, hold_balance, referrer_id, referrals_count,
+                   (SELECT COUNT(*) FROM users u2 WHERE u2.referrer_id = users.user_id AND u2.referrals_count > 0) AS active_referrals
+            FROM users
+        """)
+        users_data = cursor.fetchall()
+        if not users_data:
+            bot.send_message(chat_id, "❌ База данных пользователей пуста.")
+            return
+
+        csv_buffer = StringIO()
+        csv_writer = csv.writer(csv_buffer)
+        csv_writer.writerow(["User ID", "Balance", "Hold Balance", "Referrer ID", "Referrals Count", "Active Referrals"])
+        
+        for user in users_data:
+            user_id, balance, hold_balance, referrer_id, referrals_count, active_referrals = user
+            csv_writer.writerow([
+                user_id, f"{balance:.1f}", f"{hold_balance:.1f}", 
+                referrer_id if referrer_id else "None", referrals_count, active_referrals
+            ])
+        
+        csv_buffer.seek(0)
+        file_name = f"users_db_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+        bot.send_document(
+            chat_id, 
+            document=csv_buffer.getvalue().encode('utf-8'), 
+            visible_file_name=file_name,
+            caption="📊 Ежедневная выгрузка базы данных пользователей"
+        )
+        csv_buffer.close()
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Ошибка при выгрузке базы данных: {str(e)}")
+
+def send_daily_stats():
+    while True:
+        now = datetime.now()
+        # Отправка в 00:00 каждый день
+        if now.hour == 0 and now.minute == 0:
+            cursor.execute("SELECT COUNT(*) FROM users")
+            total_users = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM users WHERE referrals_count > 0")
+            active_users = cursor.fetchone()[0]
+            today = date.today().isoformat()
+            cursor.execute("SELECT new_users FROM stats WHERE date = ?", (today,))
+            new_users = cursor.fetchone()
+            new_users_count = new_users[0] if new_users else 0
+            
+            bot.send_message(
+                YOUR_ADMIN_ID,
+                f"📊 Ежедневная статистика ({today}):\n"
+                f"👥 Всего пользователей: {total_users}\n"
+                f"✅ Активных: {active_users}\n"
+                f"🆕 Новых за день: {new_users_count}"
+            )
+            export_users_db(YOUR_ADMIN_ID)
+        time.sleep(60)  # Проверка каждую минуту
+
+# Запуск ежедневной статистики в отдельном потоке
+threading.Thread(target=send_daily_stats, daemon=True).start()
+
+# --- Основной цикл с уведомлением при падении ---
 if __name__ == '__main__':
-    bot.polling(none_stop=True)
+    try:
+        bot.polling(none_stop=True)
+    except Exception as e:
+        bot.send_message(YOUR_ADMIN_ID, f"⚠️ Бот упал: {str(e)}")
+        raise  # Повторно вызываем исключение, чтобы увидеть его в консоли
